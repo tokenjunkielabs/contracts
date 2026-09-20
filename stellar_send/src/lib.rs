@@ -524,3 +524,5 @@ impl StellarSendContract {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod path_validation_test;
