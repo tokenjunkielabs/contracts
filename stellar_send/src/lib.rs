@@ -53,6 +53,11 @@ const KEY_SEQ: Symbol = symbol_short!("SEQ");
 /// this kind of payment platform while still bounding the worst case.
 pub const MAX_FEE_BPS: u32 = 1_000;
 
+/// Maximum number of intermediate assets accepted by a path payment.
+/// Keeping this small bounds validation work and future per-hop router calls
+/// within Soroban's resource limits.
+pub const MAX_PATH_LEN: u32 = 4;
+
 /// Global counter for subscription ids (instance storage).
 const KEY_SUB_SEQ: Symbol = symbol_short!("SUBSEQ");
 /// Persistent key prefix: (KEY_SUB, id) → Subscription.
@@ -322,6 +327,8 @@ impl StellarSendContract {
             return Err(StellarSendError::InvalidAmount);
         }
 
+        Self::validate_path(&send_token, &dest_token, &path)?;
+
         let (fee_amount, net_send_amount) = Self::split_fee(send_amount, config.fee_bps)?;
 
         // Build the full token path for the DEX: send_token → [path…] → dest_token
@@ -455,6 +462,36 @@ impl StellarSendContract {
         let next = seq.wrapping_add(1);
         env.storage().persistent().set(&key, &next);
         next
+    }
+
+    /// Validate a bounded intermediate route before any payment side effects.
+    /// An empty path is valid and represents a direct send_token -> dest_token
+    /// swap. Intermediate hops must be distinct from both endpoints and from
+    /// every other intermediate hop.
+    fn validate_path(
+        send_token: &Address,
+        dest_token: &Address,
+        path: &Vec<Address>,
+    ) -> Result<(), StellarSendError> {
+        if path.len() > MAX_PATH_LEN {
+            return Err(StellarSendError::InvalidPath);
+        }
+
+        for (index, hop) in path.try_iter().enumerate() {
+            let hop = hop.map_err(|_| StellarSendError::InvalidPath)?;
+            if &hop == send_token || &hop == dest_token {
+                return Err(StellarSendError::InvalidPath);
+            }
+
+            for previous in path.try_iter().take(index) {
+                let previous = previous.map_err(|_| StellarSendError::InvalidPath)?;
+                if previous == hop {
+                    return Err(StellarSendError::InvalidPath);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Split a gross `amount` into (fee, net) using `fee_bps` basis points.
