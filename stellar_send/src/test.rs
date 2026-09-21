@@ -6,14 +6,14 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{storage::Persistent as _, Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Env, String,
 };
 
 use crate::{
     subscription::MAX_SUBSCRIPTIONS_PAGE, ContractConfig, PaymentRequestStatus,
-    StellarSendContract, StellarSendContractClient, StellarSendError, MAX_FEE_BPS,
+    StellarSendContract, StellarSendContractClient, StellarSendError, MAX_FEE_BPS, KEY_SUB,
 };
 
 // ---------------------------------------------------------------------------
@@ -1700,4 +1700,57 @@ fn test_execute_subscription_at_max_fee_skips_zero_net_transfer() {
     assert_eq!(token_client.balance(&fee_collector), 100);
     // Payer debited full 1_000 gross (fee + net legs combined).
     assert_eq!(token_client.balance(&payer), 9_000);
+}
+
+
+#[test]
+fn test_yearly_subscription_ttl_covers_next_due_date() {
+    let (env, client, admin, fee_collector, token, _token_admin) = setup();
+
+    // A one-year cadence is deliberately much longer than the ordinary
+    // persistent-entry minimum. Give the test host enough maximum TTL headroom
+    // so the production cadence-aware extension is not clipped by the host cap.
+    const YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
+    const LEDGER_SECONDS: u64 = 5;
+    let ledgers_until_due =
+        ((YEAR_SECONDS + LEDGER_SECONDS - 1) / LEDGER_SECONDS) as u32;
+    env.ledger().set_min_persistent_entry_ttl(10);
+    env.ledger().set_max_entry_ttl(ledgers_until_due + 20_000);
+
+    client.initialize(&admin, &0u32, &fee_collector);
+
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let first_due = env.ledger().timestamp() + YEAR_SECONDS;
+
+    let id = client.create_subscription(
+        &payer,
+        &recipient,
+        &token,
+        &1_000i128,
+        &YEAR_SECONDS,
+        &first_due,
+        &None,
+        &None,
+    );
+
+    // Persistent::get_ttl reports the number of ledgers for which the entry
+    // remains accessible. A value beyond the one-year due horizon proves the
+    // subscription can still be loaded when its first payment becomes due,
+    // without a RestoreFootprintOp or any other manual subscription restore.
+    let ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&(KEY_SUB, id))
+    });
+    assert!(
+        ttl > ledgers_until_due,
+        "cadence-aware TTL must keep a yearly subscription live through its next due date"
+    );
+
+    // Permissionless keepers can refresh the same lifecycle horizon while the
+    // subscription is dormant; no payer signature is needed for this call.
+    client.keep_subscription_alive(&id);
+    let refreshed_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&(KEY_SUB, id))
+    });
+    assert!(refreshed_ttl >= ttl);
 }
