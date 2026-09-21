@@ -31,6 +31,21 @@
 //! intentional choice (e.g. an indefinite payroll-style payment) — the payer
 //! opts into a bound rather than having one imposed.
 //!
+//! ## Persistent TTL and unattended keepers (#43)
+//!
+//! A subscription is persistent, but persistent Soroban entries still expire
+//! by ledger TTL. Creation and every successful execution therefore refresh
+//! `(KEY_SUB, id)` far enough to cover the subscription cadence, the next due
+//! timestamp, and an explicit expiry when one is present. The requested horizon
+//! is capped at the network's live `max_ttl`, because a contract cannot extend
+//! an entry farther than the host permits in one transaction.
+//!
+//! `keep_subscription_alive` is permissionless so the same untrusted keeper
+//! model used by `execute_subscription` can proactively refresh a dormant
+//! subscription before its entry approaches archival. For a cadence or expiry
+//! beyond the network's maximum TTL horizon, keepers must call it periodically;
+//! there is no contract-side way to promise a single extension beyond `max_ttl`.
+//!
 //! ## Catch-up bursts are intentionally unchanged
 //!
 //! `execute_subscription` still advances `next_execution_time` by exactly
@@ -75,6 +90,13 @@ use crate::{
 /// this constant) rather than one call risking Soroban's per-invocation
 /// resource limits (#48).
 pub const MAX_SUBSCRIPTIONS_PAGE: u32 = 50;
+
+/// Soroban ledger close time used to translate wall-clock subscription cadence
+/// into a persistent-storage TTL target. The one-day ledger cushion below
+/// absorbs ordinary close-time variance; the final target is always capped at
+/// the host-reported maximum TTL.
+const SUBSCRIPTION_TTL_LEDGER_SECONDS: u64 = 5;
+const SUBSCRIPTION_TTL_SAFETY_LEDGERS: u64 = 17_280;
 
 /// A recurring payment authorised by `payer`.
 #[contracttype]
@@ -171,6 +193,7 @@ impl StellarSendContract {
         };
 
         env.storage().persistent().set(&(KEY_SUB, id), &sub);
+        Self::refresh_subscription_ttl(&env, id, &sub);
         Self::record_payer_subscription(&env, &payer, id);
         Self::record_recipient_subscription(&env, &recipient, id);
 
@@ -274,6 +297,11 @@ impl StellarSendContract {
             token_client.transfer_from(&spender, &sub.payer, &sub.recipient, &net_amount);
         }
 
+        // Refresh only on the successful execution path. If a later operation
+        // in this invocation fails, Soroban transaction atomicity rolls the TTL
+        // extension back together with the state and token transfers.
+        Self::refresh_subscription_ttl(&env, id, &sub);
+
         crate::events::emit_subscription_executed(
             &env,
             id,
@@ -287,6 +315,15 @@ impl StellarSendContract {
         );
 
         Ok(net_amount)
+    }
+
+    /// Permissionlessly refresh a subscription's persistent TTL without
+    /// executing a payment. Keepers should submit this as a transaction for
+    /// cadences that can sit dormant near the network's maximum TTL horizon.
+    pub fn keep_subscription_alive(env: Env, id: u64) -> Result<(), StellarSendError> {
+        let sub = Self::load_subscription(&env, id)?;
+        Self::refresh_subscription_ttl(&env, id, &sub);
+        Ok(())
     }
 
     /// Fetch a subscription by id.
@@ -390,6 +427,34 @@ impl StellarSendContract {
             }
         }
         ids
+    }
+
+    fn refresh_subscription_ttl(env: &Env, id: u64, sub: &Subscription) {
+        let now = env.ledger().timestamp();
+        let until_due = sub.next_execution_time.saturating_sub(now);
+        let until_expiry = sub
+            .expiry_time
+            .map(|expiry| expiry.saturating_sub(now))
+            .unwrap_or(0);
+
+        // Include the cadence even when the current payment is already due, so
+        // a newly-created or just-executed subscription survives to the next
+        // expected keeper touch. Round up seconds -> ledgers, then add one day
+        // of cushion for normal ledger-close variance.
+        let horizon_seconds = sub.interval_seconds.max(until_due).max(until_expiry);
+        let horizon_ledgers = horizon_seconds
+            .saturating_add(SUBSCRIPTION_TTL_LEDGER_SECONDS - 1)
+            / SUBSCRIPTION_TTL_LEDGER_SECONDS;
+        let requested = horizon_ledgers.saturating_add(SUBSCRIPTION_TTL_SAFETY_LEDGERS);
+        let extend_to = requested
+            .min(u64::from(env.storage().max_ttl()))
+            .max(1) as u32;
+
+        env.storage().persistent().extend_ttl(
+            &(KEY_SUB, id),
+            extend_to.saturating_sub(1),
+            extend_to,
+        );
     }
 
     fn load_subscription(env: &Env, id: u64) -> Result<Subscription, StellarSendError> {
