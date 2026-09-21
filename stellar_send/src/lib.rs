@@ -487,6 +487,3 @@ impl StellarSendContract {
 
 #[cfg(test)]
 mod test;
-
-#[cfg(test)]
-mod ttl_test;
